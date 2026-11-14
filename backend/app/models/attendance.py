@@ -32,6 +32,9 @@ class User(Base):
     # column as NOT NULL DEFAULT 0, and a MISSING claim is treated as v0 so
     # pre-feature tokens keep working after deploy.
     token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    # F3: lifetime XP from near-perfect chimp sessions; level is derived from
+    # the cap table in app/services/xp.py (never stored — one source of truth).
+    game_xp: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -190,6 +193,9 @@ class AttendanceRecord(Base):
     remarks: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # Chimp cognitive challenge score (client-attested, gated at submit)
     game_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # F3: set once when this record's XP was granted at finalize; makes the
+    # award idempotent across re-finalize replays of prior records.
+    xp_awarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="false")
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

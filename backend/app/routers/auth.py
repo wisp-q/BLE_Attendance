@@ -28,6 +28,7 @@ from app.schemas.auth import (
     UserResponse,
     VerifyOtpRequest,
 )
+from app.services.xp import level_for_xp, xp_progress
 from app.services.email import dispatch_otp_email, generate_otp
 from app.services.rate_limiter import (
     login_email_limiter,
@@ -50,6 +51,7 @@ def ensure_utc(dt: datetime) -> datetime:
 
 # Convert User model instance to UserResponse schema
 def _to_user_response(user: User) -> UserResponse:
+    level = level_for_xp(user.game_xp)
     return UserResponse(
         id=user.id,
         name=user.full_name,
@@ -60,6 +62,9 @@ def _to_user_response(user: User) -> UserResponse:
         program=user.program,
         semester=user.semester,
         section=user.section,
+        game_xp=user.game_xp,
+        game_level=level,
+        game_xp_progress=xp_progress(user.game_xp, level),
     )
 
 

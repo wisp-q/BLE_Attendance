@@ -256,6 +256,9 @@ internal fun StudentSection(
                         .weight(1f)
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                     seed = "$detectedSessionId:$sessionSalt:$studentId".hashCode(),
+                    // F3: level comes from the server via the profile; it
+                    // scales round counts and windows (level 1 = today's game).
+                    level = user.gameLevel,
                     startDelayMs = chimpStartDelayMs,
                     onFinished = { score ->
                         lastGameScore = score

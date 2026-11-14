@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -373,6 +374,48 @@ fun PokemonTrainerCard(
                             text = dept,
                             fontSize = 12.sp,
                             color = AppTheme.colors.textSecondary.copy(alpha = 0.75f)
+                        )
+                    }
+                }
+            }
+
+            // F3: XP/level row — students only (no chimp game, no bar for
+            // other roles). Fill uses the level's gym-badge color; level 5 is
+            // the cap and shows MAX.
+            if (user?.hasRole(Role.STUDENT) == true) {
+                val level = user.gameLevel.coerceIn(1, 5)
+                val xpColor = gymBadgeColors[level - 1]
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = xpColor
+                    ) {
+                        Text(
+                            text = if (level >= 5) "LV $level MAX" else "LV $level",
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            color = Color.White,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.5.dp)
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(AppTheme.colors.surfaceBorder)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .fillMaxWidth(user.gameXpProgress.coerceIn(0f, 1f))
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(xpColor)
                         )
                     }
                 }

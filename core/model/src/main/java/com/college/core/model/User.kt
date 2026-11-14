@@ -11,7 +11,12 @@ data class User(
     val year: String? = null,
     val program: String? = null,
     val semester: Int? = null,
-    val section: String? = null
+    val section: String? = null,
+    // F3: chimp-game XP/level from the server. Defaults match a fresh
+    // account and keep Gson lenient over older cached payloads.
+    val gameXp: Int = 0,
+    val gameLevel: Int = 1,
+    val gameXpProgress: Float = 0f
 ) {
     val primaryRole: Role? get() = roles.maxByOrNull { it.priority }
 

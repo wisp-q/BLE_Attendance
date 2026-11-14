@@ -4092,3 +4092,340 @@ async def test_duplicate_face_does_not_vandalize_matched_student():
             if r.status == "DUPLICATE_FACE_PROXY":
                 continue
             assert r.status != "DUPLICATE_FACE_PROXY"
+
+
+@pytest.mark.anyio
+async def test_auth_me_carries_game_fields():
+    # F3: /auth/me (and the login TokenResponse) must carry the XP/level
+    # triple the profile card renders. Fresh account: level 1, no XP.
+    from httpx import AsyncClient, ASGITransport
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+    from app.database import get_db
+    from app.models.attendance import Base
+
+    test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    auth_db = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def override_get_db():
+        async with auth_db() as s:
+            yield s
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        tok = await _register_battery_student(client, auth_db)
+        me = await client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {tok}"})
+        assert me.status_code == 200, me.text
+        body = me.json()
+        assert body["game_xp"] == 0
+        assert body["game_level"] == 1
+        assert body["game_xp_progress"] == 0.0
+
+
+@pytest.mark.anyio
+async def test_level3_student_fails_gate_below_17():
+    # F3: pass threshold scales with the student's level (ceil 50% of the
+    # level max, floor 15). A level-3 student (achievable max 34) needs 17;
+    # a 16 that would pass at level 1 must not keep them VERIFIED_PRESENT.
+    from httpx import AsyncClient, ASGITransport
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+    from app.database import get_db
+    from app.models.attendance import Base, User
+    from app.routers.attendance import derive_short_device_key
+
+    test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    seal_db = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def override_get_db():
+        async with seal_db() as s:
+            yield s
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        tok_teacher = await _register_test_teacher(client, seal_db, "Prof. Threshold", "threshold@univ.edu")
+        tok_stud1 = await _register_roll_student(client, seal_db, "Level Three", "level.three@univ.edu", "22B6701")
+        tok_stud2 = await _register_roll_student(client, seal_db, "Level One", "level.one@univ.edu", "22B6702")
+        k1 = derive_short_device_key("22B6701")
+        k2 = derive_short_device_key("22B6702")
+
+        # Force student 1 to level 3 (band starts at 3000 XP).
+        async with seal_db() as s:
+            lv3 = (await s.execute(select(User).where(User.roll_number == "22B6701"))).scalars().one()
+            lv3.game_xp = 3000
+            await s.commit()
+
+        s_res = await client.post(
+            "/api/v1/attendance/sessions",
+            headers={"Authorization": f"Bearer {tok_teacher}"},
+            json={"session_token": "M7X1", "total_enrolled": 2},
+        )
+        assert s_res.status_code == 201, s_res.text
+        session_id = s_res.json()["id"]
+        wire_salt = s_res.json()["session_wire_salt"]
+        session_url = f"/api/v1/attendance/sessions/{session_id}/submit-neighbors"
+
+        r1 = await client.post(
+            session_url,
+            headers={"Authorization": f"Bearer {tok_stud1}"},
+            json={"game_score": 16, "student_id": k1, "neighbors": [k2], "session_salt": wire_salt},
+        )
+        assert r1.status_code == 200, r1.text
+        r2 = await client.post(
+            session_url,
+            headers={"Authorization": f"Bearer {tok_stud2}"},
+            json={"game_score": 16, "student_id": k2, "neighbors": [k1], "session_salt": wire_salt},
+        )
+        assert r2.status_code == 200, r2.text
+
+        fin = await client.post(
+            f"/api/v1/attendance/sessions/{session_id}/finalize",
+            headers={"Authorization": f"Bearer {tok_teacher}"},
+            json={"records": []},
+        )
+        assert fin.status_code == 200, fin.text
+        record_map = {r["ble_device_id"]: r for r in fin.json()["records"]}
+
+        assert record_map[k1]["status"] == "COGNITIVE_CHALLENGE_FAILED"
+        assert "< 17" in record_map[k1]["remarks"]
+        # Level-1 classmate with the same score still passes.
+        assert record_map[k2]["status"] == "VERIFIED_PRESENT"
+
+
+@pytest.mark.anyio
+async def test_level1_student_passes_gate_at_15():
+    # F3 regression pin: at level 1 the gate stays exactly 15 — an honest
+    # student at today's threshold must never be failed by the leveling system.
+    from httpx import AsyncClient, ASGITransport
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+    from app.database import get_db
+    from app.models.attendance import Base
+    from app.routers.attendance import derive_short_device_key
+
+    test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    seal_db = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def override_get_db():
+        async with seal_db() as s:
+            yield s
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        tok_teacher = await _register_test_teacher(client, seal_db, "Prof. Floor", "floor@univ.edu")
+        tok_stud1 = await _register_roll_student(client, seal_db, "Floor One", "floor.one@univ.edu", "22B6711")
+        tok_stud2 = await _register_roll_student(client, seal_db, "Floor Two", "floor.two@univ.edu", "22B6712")
+        k1 = derive_short_device_key("22B6711")
+        k2 = derive_short_device_key("22B6712")
+
+        s_res = await client.post(
+            "/api/v1/attendance/sessions",
+            headers={"Authorization": f"Bearer {tok_teacher}"},
+            json={"session_token": "M7X2", "total_enrolled": 2},
+        )
+        assert s_res.status_code == 201, s_res.text
+        session_id = s_res.json()["id"]
+        wire_salt = s_res.json()["session_wire_salt"]
+        session_url = f"/api/v1/attendance/sessions/{session_id}/submit-neighbors"
+
+        for tok, key, peer in [(tok_stud1, k1, k2), (tok_stud2, k2, k1)]:
+            r = await client.post(
+                session_url,
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"game_score": 15, "student_id": key, "neighbors": [peer], "session_salt": wire_salt},
+            )
+            assert r.status_code == 200, r.text
+
+        fin = await client.post(
+            f"/api/v1/attendance/sessions/{session_id}/finalize",
+            headers={"Authorization": f"Bearer {tok_teacher}"},
+            json={"records": []},
+        )
+        assert fin.status_code == 200, fin.text
+        record_map = {r["ble_device_id"]: r for r in fin.json()["records"]}
+
+        assert record_map[k1]["status"] == "VERIFIED_PRESENT"
+        assert record_map[k2]["status"] == "VERIFIED_PRESENT"
+
+
+@pytest.mark.anyio
+async def test_finalize_awards_xp_for_perfect_score():
+    # F3: XP is paid when a record finalizes VERIFIED_PRESENT with a score at
+    # or above the level's gain threshold (level 1: 24). Score 24 -> 60 XP,
+    # score 26 -> 80 XP (+20 max bonus). Isolated/spoofed sessions pay nothing.
+    import uuid
+
+    from httpx import AsyncClient, ASGITransport
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+    from app.database import get_db
+    from app.models.attendance import AttendanceRecord, AttendanceSession, Base, User
+    from app.routers.attendance import derive_short_device_key
+
+    test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    seal_db = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def override_get_db():
+        async with seal_db() as s:
+            yield s
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        tok_teacher = await _register_test_teacher(client, seal_db, "Prof. Reward", "reward@univ.edu")
+        tok_stud1 = await _register_roll_student(client, seal_db, "Ace One", "ace.one@univ.edu", "22B6721")
+        tok_stud2 = await _register_roll_student(client, seal_db, "Ace Two", "ace.two@univ.edu", "22B6722")
+        tok_stud3 = await _register_roll_student(client, seal_db, "No Xp", "no.xp@univ.edu", "22B6723")
+        k1 = derive_short_device_key("22B6721")
+        k2 = derive_short_device_key("22B6722")
+        k3 = derive_short_device_key("22B6723")
+
+        s_res = await client.post(
+            "/api/v1/attendance/sessions",
+            headers={"Authorization": f"Bearer {tok_teacher}"},
+            json={"session_token": "M8X1", "total_enrolled": 3},
+        )
+        assert s_res.status_code == 201, s_res.text
+        session_id = s_res.json()["id"]
+        wire_salt = s_res.json()["session_wire_salt"]
+        session_url = f"/api/v1/attendance/sessions/{session_id}/submit-neighbors"
+
+        # Mutual pair (verified): 24 and 26. Third reports nobody (isolated).
+        for tok, key, peers, score in [
+            (tok_stud1, k1, [k2], 24),
+            (tok_stud2, k2, [k1], 26),
+            (tok_stud3, k3, [], 26),
+        ]:
+            r = await client.post(
+                session_url,
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"game_score": score, "student_id": key, "neighbors": peers, "session_salt": wire_salt},
+            )
+            assert r.status_code == 200, r.text
+
+        fin = await client.post(
+            f"/api/v1/attendance/sessions/{session_id}/finalize",
+            headers={"Authorization": f"Bearer {tok_teacher}"},
+            json={"records": []},
+        )
+        assert fin.status_code == 200, fin.text
+
+        async with seal_db() as s:
+            xp_by_roll = {
+                u.roll_number: u.game_xp
+                for u in (await s.execute(select(User))).scalars().all()
+                if u.roll_number
+            }
+            assert xp_by_roll["22B6721"] == 60   # score 24 -> 50 + 1*10
+            assert xp_by_roll["22B6722"] == 80   # score 26 -> +20 max bonus
+            assert xp_by_roll["22B6723"] == 0    # isolated -> never verified
+
+            awarded = (await s.execute(
+                select(AttendanceRecord).where(
+                    AttendanceRecord.session_id == uuid.UUID(session_id),
+                    AttendanceRecord.status == "VERIFIED_PRESENT",
+                )
+            )).scalars().all()
+            assert len(awarded) == 2
+            assert all(rec.xp_awarded for rec in awarded)
+
+            # Direct re-scan of the same session must pay nothing more —
+            # xp_awarded makes the award idempotent across replays.
+            from app.services.xp import award_xp_for_session
+            session_obj = (await s.execute(
+                select(AttendanceSession).where(AttendanceSession.id == uuid.UUID(session_id))
+            )).scalars().one()
+            granted = await award_xp_for_session(s, session_obj)
+            assert granted == 0
+            still = {
+                u.roll_number: u.game_xp
+                for u in (await s.execute(select(User))).scalars().all()
+                if u.roll_number
+            }
+            assert still["22B6721"] == 60
+            assert still["22B6722"] == 80
+
+
+@pytest.mark.anyio
+async def test_finalize_pays_nothing_below_gain_threshold():
+    # F3: passing the gate is not enough — only near-perfect scores earn XP.
+    # Score 20 passes the level-1 gate (15) but is below the gain line (24).
+    from httpx import AsyncClient, ASGITransport
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+    from app.database import get_db
+    from app.models.attendance import Base, User
+    from app.routers.attendance import derive_short_device_key
+
+    test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    seal_db = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def override_get_db():
+        async with seal_db() as s:
+            yield s
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        tok_teacher = await _register_test_teacher(client, seal_db, "Prof. Midband", "midband@univ.edu")
+        tok_stud1 = await _register_roll_student(client, seal_db, "Mid One", "mid.one@univ.edu", "22B6731")
+        tok_stud2 = await _register_roll_student(client, seal_db, "Mid Two", "mid.two@univ.edu", "22B6732")
+        k1 = derive_short_device_key("22B6731")
+        k2 = derive_short_device_key("22B6732")
+
+        s_res = await client.post(
+            "/api/v1/attendance/sessions",
+            headers={"Authorization": f"Bearer {tok_teacher}"},
+            json={"session_token": "M8X2", "total_enrolled": 2},
+        )
+        assert s_res.status_code == 201, s_res.text
+        session_id = s_res.json()["id"]
+        wire_salt = s_res.json()["session_wire_salt"]
+        session_url = f"/api/v1/attendance/sessions/{session_id}/submit-neighbors"
+
+        for tok, key, peer in [(tok_stud1, k1, k2), (tok_stud2, k2, k1)]:
+            r = await client.post(
+                session_url,
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"game_score": 20, "student_id": key, "neighbors": [peer], "session_salt": wire_salt},
+            )
+            assert r.status_code == 200, r.text
+
+        fin = await client.post(
+            f"/api/v1/attendance/sessions/{session_id}/finalize",
+            headers={"Authorization": f"Bearer {tok_teacher}"},
+            json={"records": []},
+        )
+        assert fin.status_code == 200, fin.text
+        record_map = {r["ble_device_id"]: r for r in fin.json()["records"]}
+        assert record_map[k1]["status"] == "VERIFIED_PRESENT"  # gate passes
+
+        async with seal_db() as s:
+            xp_by_roll = {
+                u.roll_number: u.game_xp
+                for u in (await s.execute(select(User))).scalars().all()
+                if u.roll_number
+            }
+            assert xp_by_roll["22B6731"] == 0
+            assert xp_by_roll["22B6732"] == 0

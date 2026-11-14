@@ -55,7 +55,12 @@ data class UserResponse(
     val department: String? = null,
     val program: String? = null,
     val semester: Int? = null,
-    val section: String? = null
+    val section: String? = null,
+    // F3: XP/level triple for the trainer card. Defaults keep legacy cached
+    // user JSON (no game_* keys) parseable after an app update.
+    @SerializedName("game_xp") val gameXp: Int = 0,
+    @SerializedName("game_level") val gameLevel: Int = 1,
+    @SerializedName("game_xp_progress") val gameXpProgress: Float = 0f
 )
 
 data class TokenResponse(

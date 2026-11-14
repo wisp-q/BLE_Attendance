@@ -61,6 +61,11 @@ class UserResponse(BaseModel):
     program: Optional[str] = None
     semester: Optional[int] = None
     section: Optional[str] = None
+    # F3: XP/level triple for the Pokemon trainer card. game_level and
+    # game_xp_progress are derived here — the DB stores lifetime game_xp only.
+    game_xp: int = 0
+    game_level: int = 1
+    game_xp_progress: float = 0.0
 
     model_config = ConfigDict(from_attributes=True)
 

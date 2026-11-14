@@ -63,6 +63,9 @@ private const val MASK4 = 0xFL
 // boundaries are synchronized class-wide, so no mid-game desync exists):
 //   r1: 1.9 s view + 2.5 s tap | r2: 2.3 + 3.5 | r3: 3.3 + 4.5 | r4: 4.0 + 5.5
 // Total 27.5 s exactly.
+// F3 (levels 3-5): counts 9-12 need their own windows — the old else-branch
+// silently reused the R4 pair for any n > 7. Growth continues the existing
+// pattern: ~+700 ms view / +1000 ms tap per extra number (tunable).
 private const val GRID_R1_VIEW = 1900L
 private const val GRID_R1_TAP = 2500L
 private const val GRID_R2_VIEW = 2300L
@@ -71,6 +74,14 @@ private const val GRID_R3_VIEW = 3300L
 private const val GRID_R3_TAP = 4500L
 private const val GRID_R4_VIEW = 4000L
 private const val GRID_R4_TAP = 5500L
+private const val GRID_R5_VIEW = 4700L
+private const val GRID_R5_TAP = 6500L
+private const val GRID_R6_VIEW = 5400L
+private const val GRID_R6_TAP = 7500L
+private const val GRID_R7_VIEW = 6100L
+private const val GRID_R7_TAP = 8500L
+private const val GRID_R8_VIEW = 6800L
+private const val GRID_R8_TAP = 9500L
 
 private inline fun nibble(board: Long, idx: Int): Int = ((board ushr (idx * 4)) and MASK4).toInt()
 private inline fun withNibble(board: Long, idx: Int, value: Int): Long {
@@ -78,17 +89,20 @@ private inline fun withNibble(board: Long, idx: Int, value: Int): Long {
     return (board and (MASK4 shl shift).inv()) or ((value.toLong() and MASK4) shl shift)
 }
 
-private fun countForRound(round: Int): Int = when (round) {
-    1 -> 5
-    2 -> 6
-    3 -> 7
-    else -> 8
-}
+// F3: round counts scale with the server-assigned level. Level 1 is today's
+// game bit-for-bit (5/6/7/8, max 26); level 5 shows 9/10/11/12 (max 42, fits
+// the 4x4 grid). Formula reproduces the approved table exactly.
+private fun countForRound(round: Int, level: Int): Int = 3 + level + round
 
 private fun viewWindowMs(n: Int): Long = when (n) {
     5 -> GRID_R1_VIEW
     6 -> GRID_R2_VIEW
     7 -> GRID_R3_VIEW
+    8 -> GRID_R4_VIEW
+    9 -> GRID_R5_VIEW
+    10 -> GRID_R6_VIEW
+    11 -> GRID_R7_VIEW
+    12 -> GRID_R8_VIEW
     else -> GRID_R4_VIEW
 }
 
@@ -96,6 +110,11 @@ private fun tapWindowMs(n: Int): Long = when (n) {
     5 -> GRID_R1_TAP
     6 -> GRID_R2_TAP
     7 -> GRID_R3_TAP
+    8 -> GRID_R4_TAP
+    9 -> GRID_R5_TAP
+    10 -> GRID_R6_TAP
+    11 -> GRID_R7_TAP
+    12 -> GRID_R8_TAP
     else -> GRID_R4_TAP
 }
 
@@ -145,6 +164,9 @@ private val ROUND_PALETTES = listOf(
 fun ChimpGridGame(
     modifier: Modifier = Modifier,
     seed: Int = 0,
+    // F3: server-assigned level (1-5) from the student's profile. Scales the
+    // per-round number counts and the view/tap windows. Level 1 = current game.
+    level: Int = 1,
     // Synchronized start: all students in the room begin round 1 at the same
     // instant (teacher countdown beacon). The grid stays empty until then.
     startDelayMs: Long = 0L,
@@ -189,7 +211,7 @@ fun ChimpGridGame(
 
     fun newRound(r: Int, roundStart: Long) {
         round = r
-        val n = countForRound(r)
+        val n = countForRound(r, level)
         count = n
         // place 1..n into random distinct cells (bit ops on 64-bit board)
         val cells = IntArray(CELLS) { it }
@@ -404,6 +426,7 @@ fun ChimpGridGame(
                     ChimpMascot(
                         score = score,
                         round = round,
+                        level = level,
                         gameStarted = true,
                         mistakeMade = wrongCell >= 0,
                         accentColor = cellAccent.value
@@ -581,6 +604,7 @@ private fun ChimpMoodPortrait(
 private fun ChimpMascot(
     score: Int,
     round: Int,
+    level: Int,
     gameStarted: Boolean,
     mistakeMade: Boolean,
     accentColor: Color,
@@ -589,7 +613,7 @@ private fun ChimpMascot(
     // Performance ratio: correct taps over every number shown so far. A round
     // is counted as "claimable" the moment it starts, so a mistake instantly
     // drags the ratio down (confused act) and clean taps pull it back up.
-    val possibleSoFar = (1..round).sumOf { countForRound(it) }
+    val possibleSoFar = (1..round).sumOf { countForRound(it, level) }
     val ratio = if (gameStarted && possibleSoFar > 0) score.toFloat() / possibleSoFar else 0.5f
     val mood = when {
         !gameStarted -> ChimpMood.READY

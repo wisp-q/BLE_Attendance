@@ -80,6 +80,7 @@ from app.services.face_engine import face_registry
 from app.services.graph_engine import audit_classroom_mesh
 from app.services.rate_limiter import face_lab_limiter
 from app.services.submission_buffer import submission_buffer
+from app.services.xp import award_xp_for_session, level_for_xp, pass_threshold
 
 # --- H5: server-issued session salt helpers ---
 # Canonical salt = high-entropy secret stored server-side (never on BLE wire).
@@ -1324,13 +1325,29 @@ async def finalize_attendance_session(
     # verdict without a passing chimp score can never stand — the legacy path
     # previously produced VERIFIED rows with a NULL game_score, silently
     # bypassing the challenge gate.
+    # F3: the threshold scales with the student's level (ceil 50% of the
+    # level's achievable score, floor 15). Students with no bound account are
+    # held to the level-1 floor.
+    _student_ids = {
+        rec.student_id for rec in [*prior_records, *records_to_create]
+        if rec.student_id is not None
+    }
+    _level_by_student: dict[uuid.UUID, int] = {}
+    if _student_ids:
+        _xp_rows = await db.execute(
+            select(User.id, User.game_xp).where(User.id.in_(_student_ids))
+        )
+        _level_by_student = {
+            uid: level_for_xp(game_xp) for uid, game_xp in _xp_rows.all()
+        }
     for rec in [*prior_records, *records_to_create]:
-        if rec.status == "VERIFIED_PRESENT" and (rec.game_score is None or rec.game_score < 15):
+        _threshold = pass_threshold(_level_by_student.get(rec.student_id, 1))
+        if rec.status == "VERIFIED_PRESENT" and (rec.game_score is None or rec.game_score < _threshold):
             rec.status = "COGNITIVE_CHALLENGE_FAILED"
             rec.verification_method = "COGNITIVE_CHALLENGE"
             rec.remarks = (
                 f"Chimp challenge failed: score "
-                f"{rec.game_score if rec.game_score is not None else 'missing'} < 15"
+                f"{rec.game_score if rec.game_score is not None else 'missing'} < {_threshold}"
             )
 
     # Batch inserts all records and cleans staged submissions
@@ -1346,6 +1363,10 @@ async def finalize_attendance_session(
     # the session date are marked LEAVE instead of ABSENT (or given a LEAVE
     # row). Runs after the verdict gate so the gate never sees LEAVE rows.
     await _apply_approved_leave_overlay(session_obj, db)
+
+    # F3: pay XP now — after the verdict gate and leave overlay, so only
+    # durable VERIFIED_PRESENT rows with a passing score earn anything.
+    await award_xp_for_session(db, session_obj)
 
     session_obj.status = "COMPLETED"
     session_obj.ended_at = datetime.now(timezone.utc)
@@ -1595,7 +1616,9 @@ async def submit_student_neighbors(
     # COGNITIVE_CHALLENGE_FAILED, and the 90 s grace path re-evaluates late
     # arrivals that do carry a score.
     face_present = bool(payload.face_image_base64) or raw_face_bytes is not None
-    if face_present and (challenge_score is None or challenge_score < 15):
+    # F3: gate at the caller's own level (ceil 50% of achievable, floor 15).
+    _my_threshold = pass_threshold(level_for_xp(current_user.game_xp if current_user else 0))
+    if face_present and (challenge_score is None or challenge_score < _my_threshold):
         score_val = challenge_score if challenge_score is not None else "missing"
         await _record_proxy_violation(
             db=db,
@@ -1603,7 +1626,7 @@ async def submit_student_neighbors(
             device_id=student_key,
             status="COGNITIVE_CHALLENGE_FAILED",
             verification_method="COGNITIVE_CHALLENGE",
-            remarks=f"Chimp challenge failed: score {score_val} < 15",
+            remarks=f"Chimp challenge failed: score {score_val} < {_my_threshold}",
             student_id=current_user.id if current_user else None,
             reported_neighbors=normalized_neighbors,
             game_score=challenge_score,
@@ -1612,7 +1635,7 @@ async def submit_student_neighbors(
         detail_score = challenge_score if challenge_score is not None else "missing"
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Cognitive challenge failed: score {detail_score} < 15",
+            detail=f"Cognitive challenge failed: score {detail_score} < {_my_threshold}",
         )
 
     # Face deduplication check (Layer 3: Camera Face Biometric Deduplication)
@@ -1763,7 +1786,7 @@ async def submit_student_neighbors(
             if (
                 existing_record.status == "COGNITIVE_CHALLENGE_FAILED"
                 and prev_score is None
-                and challenge_score >= 15
+                and challenge_score >= _my_threshold
             ):
                 partner_stmt = select(AttendanceRecord).where(
                     AttendanceRecord.session_id == target_session_id,
@@ -1899,6 +1922,10 @@ async def submit_student_neighbors(
                     f"in session {session_obj.id} — attendance record already present."
                 )
             logger.info(f"[In-Flight Grace Audit] Generated {rec_status} record for late arrival {student_key} in session {session_obj.id}")
+
+    # F3: single idempotent award scan — any VERIFIED_PRESENT row this request
+    # produced or rescued (face-verified path, in-flight grace) pays XP once.
+    await award_xp_for_session(db, session_obj)
 
     logger.info(f"[Check-In] Student: {student_key} submitted {len(normalized_neighbors)} neighbors: {normalized_neighbors} for session: {target_session_id}")
     return {
@@ -2055,13 +2082,28 @@ async def audit_and_finalize_session(
     # score can never stand (syncs stage claims but carry no score — a student
     # who never plays must not auto-verify through mutual claims alone). The
     # 90 s grace path rescues late arrivals that do carry a legitimate score.
+    # F3: the threshold scales with the student's level (ceil 50% of the
+    # level's achievable score, floor 15); unresolvable students are held to
+    # the level-1 floor.
+    _audit_student_ids = set(user_map.values())
+    _level_by_student: dict[uuid.UUID, int] = {}
+    if _audit_student_ids:
+        _xp_rows = await db.execute(
+            select(User.id, User.game_xp).where(User.id.in_(_audit_student_ids))
+        )
+        _level_by_student = {
+            uid: level_for_xp(game_xp) for uid, game_xp in _xp_rows.all()
+        }
     for item in audit_results:
         score = item.get("game_score")
-        if item["status"] == "VERIFIED_PRESENT" and (score is None or score < 15):
+        _threshold = pass_threshold(
+            _level_by_student.get(user_map.get(item["ble_device_id"].upper()), 1)
+        )
+        if item["status"] == "VERIFIED_PRESENT" and (score is None or score < _threshold):
             item["status"] = "COGNITIVE_CHALLENGE_FAILED"
             item["verification_method"] = "COGNITIVE_CHALLENGE"
             item["remarks"] = (
-                f"Chimp challenge failed: score {score if score is not None else 'missing'} < 15"
+                f"Chimp challenge failed: score {score if score is not None else 'missing'} < {_threshold}"
             )
 
     # Log the verdict so manual classroom tests are self-explaining in server logs
@@ -2174,6 +2216,10 @@ async def audit_and_finalize_session(
     # the session date are marked LEAVE instead of ABSENT (or given a LEAVE
     # row). Runs after the verdict gate so the gate never sees LEAVE rows.
     await _apply_approved_leave_overlay(session_obj, db)
+
+    # F3: pay XP now — after the verdict gate and leave overlay, so only
+    # durable VERIFIED_PRESENT rows with a passing score earn anything.
+    await award_xp_for_session(db, session_obj)
 
     session_obj.status = "COMPLETED"
     session_obj.ended_at = datetime.now(timezone.utc)

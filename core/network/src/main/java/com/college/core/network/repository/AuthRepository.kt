@@ -66,7 +66,10 @@ class AuthRepository(
             department = userDto.department,
             program = userDto.program,
             semester = userDto.semester,
-            section = userDto.section
+            section = userDto.section,
+            gameXp = userDto.gameXp,
+            gameLevel = userDto.gameLevel,
+            gameXpProgress = userDto.gameXpProgress
         )
         sessionManager.startSession(user = domainUser, token = token)
     }
